@@ -1,5 +1,6 @@
 import Groq from "groq-sdk";
 import { NextRequest, NextResponse } from "next/server";
+import { rateLimit } from "@/lib/rate-limit";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
@@ -129,6 +130,17 @@ Make the conversation feel natural, helpful, and human — while guiding serious
 Build trust, show capability, and start conversations that turn into real opportunities.`;
 
 export async function POST(req: NextRequest) {
+  const limited = rateLimit(req, "chat", 20, 60 * 60 * 1000);
+  if (!limited.success) {
+    return NextResponse.json(
+      { error: "Too many requests. Please try again later." },
+      {
+        status: 429,
+        headers: { "Retry-After": String(limited.retryAfterSeconds) },
+      }
+    );
+  }
+
   try {
     const { messages } = await req.json();
 

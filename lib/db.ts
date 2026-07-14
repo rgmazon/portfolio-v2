@@ -1,5 +1,6 @@
 import { cache } from "react";
 import { createClient } from "@/lib/supabase-server";
+import { supabasePublic } from "@/lib/supabase-public";
 import { heroData } from "@/data/hero";
 import { aboutData } from "@/data/about";
 import { EXPERIENCES, CAREER_STATS } from "@/data/experience";
@@ -156,6 +157,24 @@ export async function getProjects(): Promise<Project[]> {
     .select("*")
     .order("sort_order", { ascending: true });
   return data && data.length > 0 ? (data as Project[]) : PROJECTS;
+}
+
+export async function getProjectBySlug(slug: string): Promise<Project | null> {
+  // Uses cookieless client — callable from generateStaticParams/generateMetadata.
+  const { data } = await supabasePublic
+    .from("projects")
+    .select("*")
+    .eq("slug", slug)
+    .maybeSingle();
+  if (data) return data as Project;
+  return PROJECTS.find((p) => p.slug === slug) ?? null;
+}
+
+export async function getProjectSlugs(): Promise<string[]> {
+  // Uses cookieless client — callable from generateStaticParams at build time.
+  const { data } = await supabasePublic.from("projects").select("slug");
+  if (data && data.length > 0) return data.map((r) => r.slug as string);
+  return PROJECTS.map((p) => p.slug);
 }
 
 export type FooterData = {

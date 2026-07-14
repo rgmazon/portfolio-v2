@@ -79,6 +79,27 @@ export default function ContactForm() {
         error={errors.message?.message}
       />
 
+      {/* Honeypot — hidden from humans, harvested by bots. */}
+      <div
+        aria-hidden="true"
+        style={{
+          position: "absolute",
+          left: "-9999px",
+          width: 1,
+          height: 1,
+          overflow: "hidden",
+        }}
+      >
+        <label htmlFor="website">Website</label>
+        <input
+          id="website"
+          type="text"
+          tabIndex={-1}
+          autoComplete="off"
+          {...register("website")}
+        />
+      </div>
+
       {serverError && (
         <span className="text-red-400 text-[12px]">{serverError}</span>
       )}

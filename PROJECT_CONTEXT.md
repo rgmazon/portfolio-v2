@@ -8,13 +8,14 @@
 
 | Layer           | Tool / Version                                                                |
 | --------------- | ----------------------------------------------------------------------------- |
-| Framework       | Next.js **16.2.1** (App Router)                                               |
+| Framework       | Next.js **16.2.1** (App Router, Turbopack)                                    |
 | Language        | TypeScript 5 (strict mode)                                                    |
 | Runtime         | React 19.2.4                                                                  |
 | Styling         | Tailwind CSS **v4** + custom `@theme` tokens                                  |
 | Package manager | **pnpm**                                                                      |
 | Database / Auth | Supabase (`@supabase/ssr`, `@supabase/supabase-js`)                           |
 | Email           | Resend (`resend`)                                                             |
+| Chat            | Groq (`groq-sdk`, `llama-3.3-70b-versatile`, streamed)                        |
 | Forms           | react-hook-form + Zod + `@hookform/resolvers`                                 |
 | Icons           | lucide-react                                                                  |
 | Fonts           | Google Fonts via `next/font/google`: **Onest** (display) + **Manrope** (body) |
@@ -25,35 +26,31 @@
 
 ```
 app/
-  layout.tsx              ← Root layout: loads fonts only (no Navbar/Footer)
-  globals.css             ← All styles: @theme tokens, :root CSS vars, @layer base/utilities
+  layout.tsx                  ← Root layout: fonts only
+  globals.css                 ← @theme tokens, :root vars, @layer base/utilities, keyframes
   (main)/
-    layout.tsx            ← Renders <Navbar /> + <Footer /> for public pages
-    page.tsx              ← Home: Hero → About → Experience → Projects → Contact
-    projects/
-      [slug]/page.tsx     ← Dynamic project detail (client component)
+    layout.tsx                ← Public layout: fetches footer data, renders <Navbar /> + <Footer /> + <ChatBot />
+    page.tsx                  ← Home: parallel Promise.all of 7 data getters, respects section visibility
+    projects/[slug]/page.tsx  ← SERVER component: generateStaticParams + generateMetadata + ISR (revalidate=60)
   api/
-    contact/route.ts      ← POST endpoint; uses Resend for email delivery
+    contact/route.ts          ← POST — Resend email; Zod-validated, HTML-escaped, honeypot
+    chat/route.ts             ← POST — Groq-backed streamed chatbot
   admin/
-    layout.tsx            ← Minimal pass-through (no auth, no sidebar)
-    login/page.tsx        ← Public login page (no auth check)
-    (protected)/
-      layout.tsx          ← Auth guard → renders <AdminShell> (sidebar + main)
-      page.tsx            ← Admin dashboard
-      experience/         ← Experience CRUD
-      projects/           ← Projects CRUD
-      media/              ← Media manager
-      profile/            ← Profile settings
-      settings/           ← App settings
+    layout.tsx                ← Pass-through (no auth, no sidebar) so /admin/login isn't trapped in a redirect loop
+    login/page.tsx            ← Public Supabase email/password login
+    (protected)/              ← Route group; layout applies auth guard + <AdminShell>
+      layout.tsx
+      page.tsx                ← Dashboard
+      hero/, about/, experience/, projects/, contact/
+      media/, profile/, seo/, settings/
 ```
 
 **Route group rationale:**
 
-- `(main)` wraps all public pages so they get `Navbar` + `Footer`. The root layout is now font-only.
-- `admin/(protected)` wraps only authenticated admin pages, preventing `login/` from entering an auth redirect loop.
-- `admin/layout.tsx` is a bare pass-through so the login page renders without sidebar or auth checks.
+- `(main)` wraps public pages so they get `Navbar` + `Footer` + chat widget. The root layout is font-only.
+- `admin/(protected)` wraps only authenticated admin pages. `admin/layout.tsx` is a bare pass-through so `login/` renders without sidebar or auth.
 
-The home page is a single scrollable page. Each section is a `<section>` with an `id`:
+The home page is a single scrollable page. Section ids:
 
 | id            | Section    |
 | ------------- | ---------- |
@@ -74,42 +71,62 @@ components/
   hero/         → Hero.tsx (container) + HeroBadge, HeroHeading, HeroDescription, HeroActions, HeroSocials, Marquee, Stats
   about/        → About.tsx + AboutHeader, AboutContent, AboutQuote, HighlightCard, HighlightGrid
   experience/   → Experience.tsx + ExperienceHeader, ExperienceItem, ExperienceStats
-  projects/     → Projects.tsx + ProjectsHeader, ProjectsTableHeader, ProjectRow, ProjectsCursorPreview
+  projects/     → Projects.tsx (home section) + ProjectsHeader, ProjectsTableHeader, ProjectRow, ProjectsCursorPreview
+                  ProjectDetail.tsx (client wrapper for /projects/[slug])
   contact/      → Contact.tsx + ContactInfo, ContactForm, ContactField, ContactSuccess
-  layout/       → Navbar.tsx, footer/ (Footer.tsx, FooterBrand.tsx, FooterLinks.tsx, FooterBottom.tsx)
+  layout/       → Navbar.tsx, footer/ (Footer, FooterBrand, FooterLinks, FooterBottom)
+  chat/         → ChatBot.tsx (streams /api/chat)
+  admin/        → AdminShell + AdminSidebar + per-section forms under admin/{about,contact,experience,hero,media,profile,projects,seo,settings}/
+                  shared/ hosts generic admin-form primitives (AdminField, AdminFormShell, AdminSaveBar, AdminSection, AdminToggle)
 ```
 
 ### Rules
 
-- **Container components** destructure data and pass typed props down. They contain section layout.
+- **Container components** destructure data and pass typed props down.
 - **Sub-components** are presentational; they never fetch data.
-- Client interactivity requires `"use client"` at the top of the file. Keep it at the lowest-level component that needs it — not on containers unless they use hooks.
-- `"use client"` is on: `Navbar`, `Hero`, `About`, `Experience`, `Projects`, `ProjectRow`, `ContactForm`, `ExperienceItem`, and the project detail page.
+- Client interactivity requires `"use client"` at the top of the file. Keep it at the lowest-level component that needs it.
 
 ---
 
 ## 4. Data Layer
 
-Static/seed data lives in `/data/`:
+Data flows **Supabase → `lib/db.ts` → server components**. Static `/data/*.ts` files act as **fallbacks** when a Supabase row is missing.
 
-| File                 | Exports                                                   | Type source            |
-| -------------------- | --------------------------------------------------------- | ---------------------- |
-| `data/hero.ts`       | `heroData: HeroData`                                      | `types/hero.ts`        |
-| `data/about.ts`      | `aboutData: AboutData`                                    | `types/about.ts`       |
-| `data/experience.ts` | `EXPERIENCES: Experience[]`, `CAREER_STATS: CareerStat[]` | `types/experience.ts`  |
-| `data/footer.ts`     | `NAV_LINKS`, `SOCIAL_LINKS`                               | inline (plain objects) |
-| `types/projects.ts`  | `PROJECTS: Project[]`                                     | same file (co-located) |
+### `lib/db.ts` — public getters (all use cached/cookieless clients)
 
-Data files import their types and export named constants. There is no CMS integration yet for the public site; data is edited directly in these files.
+| Function                          | Source                                  | Fallback                |
+| --------------------------------- | --------------------------------------- | ----------------------- |
+| `getHeroData()`                   | `profile` row                           | `data/hero.ts`          |
+| `getAboutData()`                  | `profile` row                           | `data/about.ts`         |
+| `getContactInfo()`                | `profile` row                           | hard-coded defaults     |
+| `getExperiences()`                | `experiences` table (ordered)           | `data/experience.ts`    |
+| `getCareerStats()`                | `profile` row                           | `data/experience.ts`    |
+| `getProjects()`                   | `projects` table (ordered)              | `types/projects.ts`     |
+| `getProjectBySlug(slug)`          | `projects` row by slug (cookieless)     | `types/projects.ts`     |
+| `getProjectSlugs()`               | `projects.slug` (cookieless)            | `types/projects.ts`     |
+| `getFooterData()`                 | `site_settings` + `profile`             | hard-coded defaults     |
+| `getSiteVisibility()`             | `site_settings` booleans                | all `true`              |
+
+### Supabase clients
+
+| File                         | Use                                                                   |
+| ---------------------------- | --------------------------------------------------------------------- |
+| `lib/supabase.ts`            | Browser client (client components: login page, sign-out, chat widget) |
+| `lib/supabase-server.ts`     | Request-scoped async server client (server components, route handlers) |
+| `lib/supabase-middleware.ts` | `updateSession` helper for `proxy.ts`                                 |
+| `lib/supabase-public.ts`     | **Cookieless** read-only client; safe for `generateStaticParams` and `generateMetadata` at build time |
+
+RLS policies live in `supabase/schema.sql`. Public `SELECT` is open; writes require an authenticated session. Public signups are disabled in the Supabase dashboard — new admin users must be created manually.
 
 ---
 
 ## 5. TypeScript Conventions
 
 - Path alias: `@/*` maps to the workspace root.
-- Type files live in `/types/`. Types are exported as named types, not interfaces except when extension is needed.
-- `types/index.ts` is currently empty — do not re-export from it yet; import directly from the relevant type file.
-- Types for `Project` and its helper `getProjectBySlug` are co-located in `types/projects.ts`.
+- Type files live in `/types/`. Named exports, not interfaces, except when extension is needed.
+- `types/index.ts` is empty — do not re-export from it.
+- `Project` and its helper `getProjectBySlug` (local fallback) are co-located in `types/projects.ts`.
+- For form types, use `z.infer<typeof schema>`.
 
 ---
 
@@ -119,19 +136,7 @@ Data files import their types and export named constants. There is no CMS integr
 
 Tailwind v4 uses `@theme` in `globals.css` instead of a `tailwind.config.ts`. **Do not create a `tailwind.config.ts`**.
 
-```css
-/* globals.css — @theme block (design tokens) */
---color-bg: #1c1b17 → bg-bg --color-bg-darker: #131210 → bg-bg-darker
-  --color-bg-surface: #232218 → bg-bg-surface --color-cream: #fdfff0 →
-  text-cream --color-cream-dim: #e2e4d8 → text-cream-dim --color-muted: #b8baae
-  → text-muted --color-muted-dark: #6a6860 → text-muted-dark
-  --color-violet: #7c5cfc → text-violet / bg-violet --color-border: #2e2c26 →
-  border-border --spacing-dot: 5px → gap-dot --width-container: 75rem;
-```
-
-These tokens are usable as Tailwind utilities directly: `bg-bg`, `text-cream`, `border-border`, `text-violet`, etc.
-
-CSS variables are also defined in `:root` and used inline via `var(--violet)`, `var(--cream)`, etc. Both forms are present in the codebase — prefer Tailwind utility classes for new code, fall back to `var(--x)` for styles not expressible as utilities, or when using `style={{ }}` props.
+Tokens are declared under `@theme` (generating Tailwind utilities like `bg-bg`, `text-cream`, `border-border`, `text-violet`) and mirrored in `:root` as CSS variables for inline use via `var(--violet)` etc. Prefer Tailwind utilities for new code; fall back to `var(--x)` for inline `style={{}}` or styles not expressible as utilities.
 
 ### Typography
 
@@ -142,9 +147,7 @@ CSS variables are also defined in `:root` and used inline via `var(--violet)`, `
 | Inline display font reference | —       | `font-family: var(--font-display), sans-serif` or `font-[family-name:var(--font-display)]` in Tailwind |
 | Inline body font reference    | —       | `font-[family-name:var(--font-body)]`                                                                  |
 
-The `--font-onest` and `--font-manrope` CSS variables are injected by `next/font` on the `<html>` element.
-
-### Reusable CSS utility classes (defined in `@layer utilities`)
+### Reusable utility classes (`@layer utilities` in `globals.css`)
 
 | Class                 | Description                                              |
 | --------------------- | -------------------------------------------------------- |
@@ -156,12 +159,9 @@ The `--font-onest` and `--font-manrope` CSS variables are injected by `next/font
 
 ### Section container pattern
 
-All sections use this wrapper:
-
 ```tsx
 <section id="x" className="bg-bg py-20 lg:py-32">
   <div className="mx-auto w-full max-w-7xl px-4 md:px-6">
-    {/* Section label */}
     <span className="block text-[11px] uppercase tracking-widest text-violet mb-4">
       Section Name
     </span>
@@ -170,19 +170,7 @@ All sections use this wrapper:
 </section>
 ```
 
-### Section label pattern
-
-Every section starts with a small "eyebrow" label:
-
-```tsx
-<span className="block text-[11px] uppercase tracking-widest text-violet mb-4">
-  Label Text
-</span>
-```
-
 ### Tech/stack tag pattern
-
-Used in Projects and Experience:
 
 ```tsx
 <span className="text-[10px] uppercase tracking-wider text-muted-dark bg-bg-darker px-2 py-1">
@@ -196,8 +184,7 @@ Used in Projects and Experience:
 
 - **Breakpoints**: standard Tailwind (`sm: 640px`, `md: 768px`, `lg: 1024px`).
 - Desktop sections use `lg:grid-cols-[...]` or `md:grid-cols-2`.
-- Mobile vs desktop rendering inside components uses either responsive class variants or the `useIsMobile` hook (threshold 768px).
-- `useIsMobile` is used when JS logic needs to conditionally run (e.g., disabling `mousemove` tracking on mobile for `ProjectsCursorPreview`).
+- Most responsive switching is via CSS classes; `useIsMobile` (hooks/useIsMobile.ts, threshold 768px) is only used where JS logic must branch (e.g., disabling `mousemove` tracking on the Projects cursor preview, and the inline-styled `ProjectDetail` page).
 - Navbar collapses to a hamburger at `< lg`.
 
 ---
@@ -206,59 +193,41 @@ Used in Projects and Experience:
 
 ### Navbar (`components/layout/Navbar.tsx`)
 
-- Fixed, `z-100`, `bg-bg-darker`.
-- Logo: `RG.` — clicking scrolls to top.
-- Smooth-scroll via `scrollIntoView({ behavior: "smooth" })` with 300ms delay after menu close.
-- Mobile menu locks `body` scroll while open.
-- `NAV_LINKS` is defined inline in the component (not imported from `data/`).
+Fixed, `z-100`, `bg-bg-darker`. Logo `RG.` scrolls to top. Smooth-scroll via `scrollIntoView({ behavior: "smooth" })` with 300ms delay after menu close. Mobile menu locks `body` scroll while open. `NAV_LINKS` is defined inline.
 
 ### Footer (`components/layout/footer/Footer.tsx`)
 
-- Client component; uses `useIsMobile`.
-- Composed of three sub-components: `FooterBrand` (logo + tagline + email), `FooterLinks` (nav + social columns), `FooterBottom` (copyright bar).
-- Data comes from `data/footer.ts` (`NAV_LINKS`, `SOCIAL_LINKS`).
-- `bg-bg-darker`, two-row layout: top row (brand + links) separated by `border-border`, bottom row (copyright).
+Client component; uses `useIsMobile`. Composed of three sub-components: `FooterBrand`, `FooterLinks`, `FooterBottom`. Data comes from `getFooterData()` via `(main)/layout.tsx`. `bg-bg-darker`, two-row layout separated by `border-border`.
 
 ### Hero (`components/hero/Hero.tsx`)
 
-- Full-viewport height (`min-h-screen`), `bg-bg`.
-- Data flows from `heroData` in `data/hero.ts`.
-- `Marquee` is a CSS-animated infinite ticker (doubled array trick, `animate-[marquee_28s_linear_infinite]`).
-- `Stats` component is commented out in `Hero.tsx` — keep it that way unless asked to re-enable.
+Full-viewport height (`min-h-screen`), `bg-bg`. Data flows from `heroData` loaded via `getHeroData()`. `Marquee` is a CSS-animated infinite ticker. `Stats` is commented out — keep it that way unless asked.
 
 ### Projects (`components/projects/Projects.tsx`)
 
-- `PROJECTS` constant is in `types/projects.ts` (co-located with types).
-- Desktop: cursor-tracked image preview (`ProjectsCursorPreview`) uses `mousemove` on the section ref, passes `x/y` relative to section.
-- Each `ProjectRow` is clickable → `router.push(/projects/${slug})`.
-- Desktop layout grid: `grid-cols-[64px_1fr_160px_80px_80px]`.
+Home-page section. `PROJECTS` fallback is in `types/projects.ts`. Desktop: cursor-tracked image preview (`ProjectsCursorPreview`) uses `mousemove` on the section ref. Each `ProjectRow` is clickable → `router.push(/projects/${slug})`. Desktop layout grid: `grid-cols-[64px_1fr_160px_80px_80px]`.
 
-### Project Detail (`app/projects/[slug]/page.tsx`)
+### Project detail (`app/(main)/projects/[slug]/page.tsx` + `components/projects/ProjectDetail.tsx`)
 
-- Client component.
-- Image/video gallery with active index state + lightbox (keyboard nav: Escape, ArrowLeft, ArrowRight).
-- Scroll locked while lightbox is open.
-- `getProjectBySlug` helper is in `types/projects.ts`.
+- `page.tsx` is a **server component**. Exports `revalidate = 60`, `generateStaticParams()` (returns all slugs, pre-renders at build), and `generateMetadata({ params })` (per-project title, description, OG image, Twitter card). Uses `notFound()` for unknown slugs.
+- `ProjectDetail.tsx` is the client wrapper: image/video gallery with active-index state + lightbox (keyboard nav: Escape, ArrowLeft, ArrowRight). Scroll locked while lightbox is open.
+- `getProjectBySlug` and `getProjectSlugs` in `lib/db.ts` use the cookieless `supabasePublic` client so they work at build time.
 
 ### Experience (`components/experience/Experience.tsx`)
 
-- Accordion pattern: one item open at a time (`openId` state); default open is `id: 1`.
-- Layout: `lg:grid-cols-[1fr_2fr]` (header+stats left, list right).
-- Expand/collapse via `max-h-0` / `max-h-125` with `transition-all duration-300`.
+Accordion pattern: one item open at a time (`openId` state); default open is `id: 1`. Layout: `lg:grid-cols-[1fr_2fr]` (header+stats left, list right). Expand/collapse via `max-h-0`/`max-h-125` with `transition-all duration-300`.
 
 ### Contact (`components/contact/Contact.tsx`)
 
-- Two-column layout (`lg:grid-cols-2`): `ContactInfo` (left) + `ContactForm` (right).
-- Form: react-hook-form + `zodResolver(contactSchema)`.
-- `contactSchema` in `lib/validation/contact.ts` — name, email (string email), message (all required).
-- On success: shows `ContactSuccess` component with a reset button.
-- Server errors shown inline below the form fields.
+Two-column layout (`lg:grid-cols-2`): `ContactInfo` (left) + `ContactForm` (right). Form: react-hook-form + `zodResolver(contactSchema)`. Schema in `lib/validation/contact.ts` — name, email, message, optional `website` (honeypot). On success: `ContactSuccess` with a reset button. Server errors shown inline below the form fields.
 
 ### ContactField (`components/contact/ContactField.tsx`)
 
-- Accepts `registration: UseFormRegisterReturn` — spread with `{...registration}`.
-- Supports `textarea` boolean prop; defaults to `<input>`.
-- Errors rendered as `<span className="text-red-400 text-[12px]">`.
+Accepts `registration: UseFormRegisterReturn` — spread with `{...registration}`. Supports `textarea` boolean; defaults to `<input>`. Errors rendered as `<span className="text-red-400 text-[12px]">`.
+
+### ChatBot (`components/chat/ChatBot.tsx`)
+
+Public widget rendered by `(main)/layout.tsx`. Streams responses from `/api/chat` via `fetch` + `ReadableStream`.
 
 ---
 
@@ -280,64 +249,72 @@ Next.js 16 deprecates `middleware.ts` in favour of `proxy.ts` (export name `prox
 ```
 components/admin/
   AdminSidebar.tsx   ← Sidebar UI; accepts collapsed + onToggle props
-  AdminShell.tsx     ← Client component; owns collapsed state, renders sidebar + main offset
+  AdminShell.tsx     ← Client; owns collapsed state, renders sidebar + main offset
+  shared/            ← Generic admin form primitives (AdminField, AdminFormShell, AdminSaveBar, AdminSection, AdminToggle)
+  {section}/         ← Per-section forms (about, contact, experience, hero, media, profile, projects, seo, settings)
 ```
 
-**`AdminShell`** is a `"use client"` wrapper rendered by the `(protected)` layout. It holds `useState(collapsed)` and passes it down to `AdminSidebar`. The main content margin transitions between `ml-56` (expanded) and `ml-14` (collapsed).
+`AdminShell` holds `useState(collapsed)` and passes it down to `AdminSidebar`. The main content margin transitions between `ml-56` (expanded) and `ml-14` (collapsed). `AdminSidebar` shrinks to icon-only (`w-14`) when collapsed. A `PanelLeftClose`/`PanelLeftOpen` toggle sits in the header.
 
-**`AdminSidebar`** shrinks to icon-only (`w-14`) when collapsed. Nav labels and the user email are hidden; icons gain `title` tooltips. A `PanelLeftClose`/`PanelLeftOpen` toggle button sits in the header.
-
-### Supabase clients
-
-- `lib/supabase.ts` — browser client (used by client components: login page, sign-out).
-- `lib/supabase-server.ts` — async server component client (used in `(protected)/layout.tsx`).
-- `lib/supabase-middleware.ts` — `updateSession` helper called by `proxy.ts`.
-
-When implementing admin pages, use `createClient` from `lib/supabase-server.ts` for server components and route handlers.
-
-### Environment variables required
+### Environment variables
 
 ```
 NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_ANON_KEY=
 RESEND_API_KEY=
 CONTACT_TO_EMAIL=
+GROQ_API_KEY=
 ```
 
 ---
 
-## 10. API Route — Contact (`app/api/contact/route.ts`)
+## 10. API Routes
 
-- Method: `POST`
-- Reads `name`, `email`, `message` from `req.json()`.
-- Server-side validates presence + email regex (belt-and-suspenders over client Zod schema).
-- Sends email via `resend.emails.send()` with `from: "Portfolio Contact <onboarding@resend.dev>"`.
-- Returns `{ success: true }` (200) or `{ error: "..." }` (400 / 500).
+### `app/api/contact/route.ts`
+
+- Method: `POST`.
+- Validates the body with `contactSchema` (Zod: name, email, message, optional `website`).
+- **Honeypot**: if `website` is non-empty (bots fill it), returns a fake `{ success: true }` without sending the email.
+- Escapes every interpolated value (`name`, `email`, `message`) in the HTML email body via an inline `escapeHtml` helper.
+- Strips CR/LF from `replyTo` and `subject` (`sanitizeHeader`) to neutralise email-header injection.
+- Returns `{ success: true }` (200) or `{ error: string }` (400 / 500).
+
+### `app/api/chat/route.ts`
+
+- Method: `POST`, body `{ messages: [{ role, content }] }`.
+- Sanitises and trims to last 20 messages, content capped at 2000 chars each.
+- Calls Groq `llama-3.3-70b-versatile` with a system prompt defining the assistant persona.
+- Returns a streamed `text/plain` `ReadableStream` with `Cache-Control: no-cache` + `X-Content-Type-Options: nosniff`.
+- **No rate limiting yet.** Plan §1.2 covers this.
 
 ---
 
-## 11. Hooks
+## 11. Security
+
+- `next.config.ts` sets global headers: `Strict-Transport-Security`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()`. CSP is deferred until inline styles in `ProjectDetail.tsx` are cleaned up (plan §2.7).
+- Supabase RLS is enabled on all tables; public reads, authenticated writes. Public signups are disabled in the dashboard.
+- `proxy.ts` and `lib/supabase-middleware.ts` have no `console.log` — do not reintroduce.
+
+---
+
+## 12. Hooks
 
 ### `useIsMobile(breakpoint = 768)`
 
-Location: `hooks/useIsMobile.ts`
-
-- Listens to `resize` events.
-- Returns `true` when `window.innerWidth < breakpoint`.
-- Initializes to `false` to avoid SSR mismatch.
+`hooks/useIsMobile.ts`. Listens to `resize`. Returns `true` when `window.innerWidth < breakpoint`. Initializes to `false` to avoid SSR mismatch (brief flash possible on mobile first paint).
 
 ---
 
-## 12. Animation
+## 13. Animation
 
-- **Marquee**: `@keyframes marquee` defined in `globals.css`. Used via Tailwind arbitrary value `animate-[marquee_28s_linear_infinite]`. The items array is duplicated to create seamless loop.
-- **Pulse**: `@keyframes pulse` defined in `globals.css` (used for the available-badge dot).
-- **Transitions**: standard `transition-colors duration-200` for hover states. Accordion uses `transition-all duration-300`.
+- **Marquee**: `@keyframes marquee` in `globals.css`, used via Tailwind arbitrary value `animate-[marquee_28s_linear_infinite]`. Items array is duplicated for seamless loop.
+- **Pulse**: `@keyframes pulse` in `globals.css` (used for the available-badge dot).
+- **Transitions**: `transition-colors duration-200` for hover states. Accordion uses `transition-all duration-300`.
 - No animation library is installed. Keep it CSS/Tailwind-only unless explicitly added.
 
 ---
 
-## 13. File & Naming Conventions
+## 14. File & Naming Conventions
 
 - **Pages**: `page.tsx` in the App Router directory.
 - **Components**: PascalCase, one component per file, filename matches component name.
@@ -346,32 +323,6 @@ Location: `hooks/useIsMobile.ts`
 - **Data**: camelCase or UPPER_SNAKE for arrays (`heroData`, `PROJECTS`, `EXPERIENCES`).
 - **Lib utilities**: camelCase in `lib/`.
 - **No barrel files** (`index.ts` re-exports) — import directly from source files.
-
----
-
-## 14. Current Status
-
-### Working
-
-- Public portfolio (home, project detail, contact form with Resend).
-- Admin login page (`/admin/login`) — Supabase email/password auth.
-- Admin `(protected)` layout with collapsible sidebar and auth guard.
-- `proxy.ts` session-based route protection.
-
-### Scaffolded (directories exist, no `page.tsx` yet)
-
-- `/admin/(protected)/experience/` — CRUD for experience entries.
-- `/admin/(protected)/projects/` — CRUD for projects.
-- `/admin/(protected)/media/` — media manager.
-- `/admin/(protected)/profile/` — profile settings.
-- `/admin/(protected)/settings/` — app settings.
-
-### Still empty / not implemented
-
-- `types/index.ts` — empty, do not re-export from it.
-- `types/contact.ts` — contains `SOCIALS` and `INFO` arrays used by `ContactInfo` (not a type-only file).
-- Supabase database schema and table-level CRUD operations.
-- The admin dashboard page (`/admin`) has a `page.tsx` but its content is a placeholder.
 
 ---
 
@@ -387,11 +338,13 @@ pnpm lint       # ESLint
 
 ## 16. Key Patterns to Preserve
 
-1. **Dark brutalist aesthetic** — never introduce light backgrounds or rounded corners without explicit request. Keep the raw, minimal feel.
+1. **Dark brutalist aesthetic** — never introduce light backgrounds or rounded corners without explicit request.
 2. **Section eyebrow labels** — every section gets the violet `text-[11px] uppercase tracking-widest` label.
 3. **No animation libraries** — CSS + Tailwind only.
-4. **Data in `/data/` files** — do not hardcode content strings in components.
-5. **Types in `/types/`** — keep strong typing; use `z.infer<typeof schema>` for form types.
+4. **Supabase is the source of truth** — `/data/*.ts` files are fallbacks only; do not hardcode content in components.
+5. **Types in `/types/`** — strong typing; use `z.infer<typeof schema>` for form types.
 6. **Tailwind v4 `@theme`** — add new design tokens there, not in a config file.
 7. **Max width `max-w-7xl`** — use this for all section containers.
 8. **Font references** — `font-display` / `font-body` via CSS variables, not hardcoded font names.
+9. **Server components by default** — only add `"use client"` when state, effects, event handlers, or browser-only APIs are required.
+10. **Cookieless `supabasePublic`** is required for anything called from `generateStaticParams` or `generateMetadata` during build.

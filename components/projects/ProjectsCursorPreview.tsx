@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { Project } from "@/types/projects";
 
 type Props = {
@@ -24,17 +25,20 @@ export default function ProjectsCursorPreview({
         transform: "translate(24px, -50%)",
       }}
     >
-      {projects.map((p) => (
-        <img
-          key={p.id}
-          src={p.media[0]?.src}
-          alt={p.title}
-          className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-200 ${
-            hoveredId === p.id ? "opacity-100" : "opacity-0"
-          }`}
-          onError={(e) => (e.currentTarget.style.display = "none")}
-        />
-      ))}
+      {projects.map((p) =>
+        p.media[0]?.src ? (
+          <Image
+            key={p.id}
+            src={p.media[0].src}
+            alt={p.title}
+            fill
+            sizes="280px"
+            className={`object-cover transition-opacity duration-200 ${
+              hoveredId === p.id ? "opacity-100" : "opacity-0"
+            }`}
+          />
+        ) : null
+      )}
 
       {/* fallback */}
       <div className="absolute inset-0 flex items-center justify-center">
