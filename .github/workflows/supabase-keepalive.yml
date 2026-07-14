@@ -12,6 +12,10 @@ jobs:
     steps:
       - name: Ping Supabase REST API
         run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "SUPABASE_URL or SUPABASE_ANON_KEY secret is empty/unset. Check Settings > Secrets and variables > Actions > Secrets (not Variables)."
+            exit 1
+          fi
           status=$(curl -s -o /dev/null -w "%{http_code}" \
             "${SUPABASE_URL}/rest/v1/projects?select=slug&limit=1" \
             -H "apikey: ${SUPABASE_ANON_KEY}" \
